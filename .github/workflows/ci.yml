@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run mypy
+        run: mypy macos-podcasts-opml.py
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --cov=. --cov-report=term-missing
+
+      - name: Enforce 80% coverage
+        run: pytest tests/ --cov=. --cov-fail-under=80 -q

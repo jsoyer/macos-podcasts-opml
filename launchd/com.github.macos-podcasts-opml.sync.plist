@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for daily Apple Podcasts → Pocket Casts sync.
+
+  SETUP:
+    1. Edit the paths and credentials below.
+    2. Copy to ~/Library/LaunchAgents/
+    3. Load it:
+         launchctl load ~/Library/LaunchAgents/com.github.macos-podcasts-opml.sync.plist
+    4. To unload:
+         launchctl unload ~/Library/LaunchAgents/com.github.macos-podcasts-opml.sync.plist
+
+  LOGS:
+    tail -f ~/Library/Logs/macos-podcasts-opml-sync.log
+    tail -f ~/Library/Logs/macos-podcasts-opml-sync.error.log
+
+  NOTE: Credentials are stored in plain text here. Consider using the macOS
+  Keychain and a wrapper script to retrieve them instead.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.github.macos-podcasts-opml.sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- Replace with the actual path to macos-podcasts-opml.py -->
+    <string>/usr/bin/python3</string>
+    <string>REPLACE_WITH_SCRIPT_PATH/macos-podcasts-opml.py</string>
+    <string>--sync-pocketcasts</string>
+    <string>--sync-remove</string>
+    <string>--confirm</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>POCKETCASTS_EMAIL</key>
+    <string>REPLACE_WITH_EMAIL</string>
+    <key>POCKETCASTS_PASSWORD</key>
+    <string>REPLACE_WITH_PASSWORD</string>
+  </dict>
+
+  <!-- Run daily at 09:00 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>REPLACE_WITH_HOME/Library/Logs/macos-podcasts-opml-sync.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>REPLACE_WITH_HOME/Library/Logs/macos-podcasts-opml-sync.error.log</string>
+
+  <!-- Only run when not on battery (optional — remove if unwanted) -->
+  <key>PowerType</key>
+  <string>AC</string>
+</dict>
+</plist>

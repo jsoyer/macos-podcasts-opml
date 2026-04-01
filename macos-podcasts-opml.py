@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import concurrent.futures
 import csv
+import html.parser
+import http.cookiejar
 import io
 import json
 import os
@@ -12,18 +15,21 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, cast
+from typing import Dict, Iterator, List, Optional, Tuple, cast
 from xml.dom import minidom
 
-VERSION = "2.3.0"
+VERSION = "3.0.0"
 POCKETCASTS_API = "https://api.pocketcasts.com"
 PC_RATE_LIMIT_SECS = 0.1
+OVERCAST_BASE = "https://overcast.fm"
+OC_RATE_LIMIT_SECS = 0.5
 DB_GLOB = (
     "Library/Group Containers/*.groups.com.apple.podcasts/Documents/MTLibrary.sqlite"
 )
@@ -38,6 +44,13 @@ DATE_COLUMNS = ["ZLASTPUBLISHDATE", "ZLASTDOWNLOADDATE", "ZCREATIONDATE"]
 @dataclass(frozen=True)
 class PCPodcast:
     uuid: str
+    feed_url: str
+    title: str
+
+
+@dataclass(frozen=True)
+class OCPodcast:
+    overcast_id: str  # e.g. "itunes123456789" extracted from htmlUrl
     feed_url: str
     title: str
 
@@ -331,6 +344,185 @@ def cmd_unsubscribe(
 
 
 # ---------------------------------------------------------------------------
+# Feed health check
+# ---------------------------------------------------------------------------
+
+
+def check_feed_url(url: str, timeout: int = 10) -> Optional[str]:
+    """Return None if reachable, error description otherwise."""
+    req = urllib.request.Request(url, method="HEAD")
+    req.add_header("User-Agent", f"macos-podcasts-opml/{VERSION} feed-checker")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = cast(int, resp.status)
+            if status >= 400:
+                return f"HTTP {status}"
+            return None
+    except urllib.error.HTTPError as e:
+        return f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return f"URLError: {e.reason}"
+    except OSError as e:
+        return f"Error: {e}"
+
+
+def cmd_broken(
+    podcasts: List[Podcast],
+    timeout: int = 10,
+    workers: int = 10,
+) -> None:
+    """Check all feed URLs concurrently and report unreachable ones."""
+    feeds = [(p, p.feed_url) for p in podcasts if p.feed_url]
+    if not feeds:
+        print("No podcasts with a feed URL to check.", file=sys.stderr)
+        return
+
+    total = len(feeds)
+    print(f"Checking {total} feed URLs (workers={workers}, timeout={timeout}s)…",
+          file=sys.stderr)
+
+    broken: List[Tuple[Podcast, str]] = []
+    checked = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_p: Dict[concurrent.futures.Future[Optional[str]], Podcast] = {
+            executor.submit(check_feed_url, url, timeout): p
+            for p, url in feeds
+        }
+        for future in concurrent.futures.as_completed(future_to_p):
+            p = future_to_p[future]
+            try:
+                error = future.result()
+            except Exception as exc:
+                error = f"Exception: {exc}"
+            if error:
+                broken.append((p, error))
+            checked += 1
+            if checked % 20 == 0 or checked == total:
+                print(f"  {checked}/{total} checked…", file=sys.stderr)
+
+    ok = total - len(broken)
+    if not broken:
+        print(f"\nAll {ok} feeds reachable.", file=sys.stderr)
+        return
+
+    print(f"\n{len(broken)} broken feed(s) out of {total}:")
+    for p, error in sorted(broken, key=lambda x: (x[0].title or "").lower()):
+        print(f"  [{error:<14}] {p.title or '(no title)'}")
+        print(f"                 {p.feed_url}")
+
+
+# ---------------------------------------------------------------------------
+# Statistics
+# ---------------------------------------------------------------------------
+
+
+def cmd_stats(podcasts: List[Podcast], date_column: Optional[str]) -> None:
+    total = len(podcasts)
+    if total == 0:
+        print("No podcasts found.")
+        return
+
+    with_feed = sum(1 for p in podcasts if p.feed_url)
+    with_date = sum(1 for p in podcasts if p.last_date)
+
+    now = datetime.now(tz=timezone.utc)
+
+    buckets: Dict[str, int] = {
+        "< 1 month": 0,
+        "1-3 months": 0,
+        "3-6 months": 0,
+        "6-12 months": 0,
+        "1-2 years": 0,
+        "> 2 years": 0,
+        "No date": 0,
+    }
+
+    for p in podcasts:
+        if not p.last_date:
+            buckets["No date"] += 1
+            continue
+        age = now - p.last_date
+        if age < timedelta(days=30):
+            buckets["< 1 month"] += 1
+        elif age < timedelta(days=90):
+            buckets["1-3 months"] += 1
+        elif age < timedelta(days=180):
+            buckets["3-6 months"] += 1
+        elif age < timedelta(days=365):
+            buckets["6-12 months"] += 1
+        elif age < timedelta(days=730):
+            buckets["1-2 years"] += 1
+        else:
+            buckets["> 2 years"] += 1
+
+    bar_width = 25
+    max_count = max(buckets.values(), default=1) or 1
+
+    print(f"Total podcasts  : {total}")
+    print(f"With feed URL   : {with_feed}  ({with_feed * 100 // total}%)")
+    print(f"With date data  : {with_date}  (column: {date_column or 'none'})")
+    print()
+    print("Activity (last episode date):")
+    for label, count in buckets.items():
+        bar = "#" * (count * bar_width // max_count)
+        pct = count * 100 // total if total else 0
+        print(f"  {label:<14} {count:>4}  ({pct:>2}%)  {bar}")
+
+
+# ---------------------------------------------------------------------------
+# Diff against OPML
+# ---------------------------------------------------------------------------
+
+
+def parse_opml_feeds(opml_path: Path) -> Dict[str, str]:
+    """Parse OPML file and return {feed_url: title}."""
+    try:
+        root = ET.parse(str(opml_path)).getroot()
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse OPML {opml_path}: {e}")
+    except OSError as e:
+        raise SystemExit(f"Cannot read OPML file {opml_path}: {e}")
+
+    feeds: Dict[str, str] = {}
+    for outline in root.findall(".//outline"):
+        url = outline.get("xmlUrl") or outline.get("url")
+        title = outline.get("text") or outline.get("title") or ""
+        if url:
+            feeds[url] = title
+    return feeds
+
+
+def cmd_diff(apple_podcasts: List[Podcast], opml_path: Path) -> None:
+    """Compare Apple Podcasts DB against an OPML file."""
+    opml_feeds = parse_opml_feeds(opml_path)
+    apple_feeds: Dict[str, str] = {
+        p.feed_url: p.title for p in apple_podcasts if p.feed_url
+    }
+
+    only_apple = {u: t for u, t in apple_feeds.items() if u not in opml_feeds}
+    only_opml = {u: t for u, t in opml_feeds.items() if u not in apple_feeds}
+    in_both = sum(1 for u in apple_feeds if u in opml_feeds)
+
+    print(f"Apple Podcasts DB   : {len(apple_feeds)}")
+    print(f"OPML ({opml_path.name:<18}): {len(opml_feeds)}")
+    print(f"In common           : {in_both}")
+
+    if only_apple:
+        print(f"\nOnly in Apple Podcasts ({len(only_apple)}):")
+        for url, title in sorted(only_apple.items(), key=lambda x: x[1].lower()):
+            print(f"  + {title or url}")
+
+    if only_opml:
+        print(f"\nOnly in OPML ({len(only_opml)}):")
+        for url, title in sorted(only_opml.items(), key=lambda x: x[1].lower()):
+            print(f"  - {title or url}")
+
+    if not only_apple and not only_opml:
+        print("\nNo differences — perfectly in sync.")
+
+
+# ---------------------------------------------------------------------------
 # Pocket Casts API
 # ---------------------------------------------------------------------------
 
@@ -404,10 +596,10 @@ def cmd_sync_pocketcasts(
     sync_remove: bool,
     confirm: bool,
 ) -> None:
-    print("Logging in to Pocket Casts...", file=sys.stderr)
+    print("Logging in to Pocket Casts…", file=sys.stderr)
     token = pc_login(email, password)
 
-    print("Fetching Pocket Casts subscriptions...", file=sys.stderr)
+    print("Fetching Pocket Casts subscriptions…", file=sys.stderr)
     pc_subs = pc_list_subscriptions(token)
     pc_feed_urls = {p.feed_url for p in pc_subs}
     pc_by_url: Dict[str, PCPodcast] = {p.feed_url: p for p in pc_subs}
@@ -459,6 +651,246 @@ def cmd_sync_pocketcasts(
 
 
 # ---------------------------------------------------------------------------
+# Overcast API (unofficial — web-based, may break on UI changes)
+# ---------------------------------------------------------------------------
+
+
+class _FormFieldExtractor(html.parser.HTMLParser):
+    """Extract hidden input fields from an HTML form (for CSRF tokens)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fields: Dict[str, str] = {}
+
+    def handle_starttag(
+        self, tag: str, attrs: List[Tuple[str, Optional[str]]]
+    ) -> None:
+        if tag == "input":
+            d = dict(attrs)
+            if d.get("type") == "hidden" and d.get("name"):
+                self.fields[d["name"]] = d.get("value") or ""
+
+
+def _oc_extract_form_fields(html_content: str) -> Dict[str, str]:
+    extractor = _FormFieldExtractor()
+    extractor.feed(html_content)
+    return extractor.fields
+
+
+def _oc_build_opener() -> urllib.request.OpenerDirector:
+    jar: http.cookiejar.CookieJar = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def _oc_get(opener: urllib.request.OpenerDirector, path: str) -> str:
+    req = urllib.request.Request(
+        f"{OVERCAST_BASE}{path}",
+        headers={"User-Agent": f"macos-podcasts-opml/{VERSION}"},
+    )
+    try:
+        with opener.open(req, timeout=15) as resp:
+            return cast(bytes, resp.read()).decode("utf-8")
+    except urllib.error.HTTPError as e:
+        raise SystemExit(f"Overcast GET {path} returned HTTP {e.code}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Network error reaching Overcast: {e.reason}")
+
+
+def _oc_post(
+    opener: urllib.request.OpenerDirector,
+    path: str,
+    data: Dict[str, str],
+) -> str:
+    encoded = urllib.parse.urlencode(data).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OVERCAST_BASE}{path}",
+        data=encoded,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": f"macos-podcasts-opml/{VERSION}",
+        },
+        method="POST",
+    )
+    try:
+        with opener.open(req, timeout=15) as resp:
+            return cast(bytes, resp.read()).decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"Overcast POST {path} returned {e.code}: {body[:200]}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"Network error reaching Overcast: {e.reason}")
+
+
+def oc_login(
+    email: str, password: str
+) -> Tuple[urllib.request.OpenerDirector, Dict[str, str]]:
+    """Login to Overcast. Returns (opener, csrf_fields) for subsequent POSTs."""
+    opener = _oc_build_opener()
+
+    login_html = _oc_get(opener, "/login")
+    form_fields = _oc_extract_form_fields(login_html)
+    post_data = {"email": email, "password": password}
+    post_data.update(form_fields)
+
+    resp_html = _oc_post(opener, "/login", post_data)
+
+    # Heuristic: still seeing a login form means credentials were rejected
+    if 'action="/login"' in resp_html:
+        raise SystemExit("Overcast login failed — check your credentials.")
+
+    # Fetch account page to get fresh CSRF fields for subsequent POSTs
+    account_html = _oc_get(opener, "/account")
+    csrf_fields = _oc_extract_form_fields(account_html)
+    return opener, csrf_fields
+
+
+def oc_list_subscriptions(opener: urllib.request.OpenerDirector) -> List[OCPodcast]:
+    """Export subscriptions as OPML and parse them."""
+    opml_content = _oc_get(opener, "/account/export_opml")
+    try:
+        root = ET.fromstring(opml_content)
+    except ET.ParseError as e:
+        raise SystemExit(f"Failed to parse Overcast OPML export: {e}")
+
+    result: List[OCPodcast] = []
+    for outline in root.findall(".//outline[@type='rss']"):
+        feed_url = outline.get("xmlUrl") or ""
+        title = outline.get("text") or outline.get("title") or ""
+        html_url = outline.get("htmlUrl") or ""
+        # Extract overcast_id from htmlUrl e.g. "https://overcast.fm/itunes123456"
+        overcast_id = html_url.rstrip("/").split("/")[-1] if html_url else ""
+        if feed_url:
+            result.append(
+                OCPodcast(overcast_id=overcast_id, feed_url=feed_url, title=title)
+            )
+    return result
+
+
+def oc_subscribe(
+    opener: urllib.request.OpenerDirector,
+    feed_url: str,
+    csrf_fields: Dict[str, str],
+) -> None:
+    post_data = {"feedUrl": feed_url}
+    post_data.update(csrf_fields)
+    _oc_post(opener, "/account/add_podcast_by_feed_url", post_data)
+
+
+def oc_unsubscribe(
+    opener: urllib.request.OpenerDirector,
+    overcast_id: str,
+    csrf_fields: Dict[str, str],
+) -> None:
+    _oc_post(opener, f"/{overcast_id}/delete", dict(csrf_fields))
+
+
+def cmd_sync_overcast(
+    apple_feeds: List[str],
+    email: str,
+    password: str,
+    sync_remove: bool,
+    confirm: bool,
+) -> None:
+    print("Logging in to Overcast…", file=sys.stderr)
+    opener, csrf_fields = oc_login(email, password)
+
+    print("Fetching Overcast subscriptions…", file=sys.stderr)
+    oc_subs = oc_list_subscriptions(opener)
+    oc_feed_urls = {p.feed_url for p in oc_subs}
+    oc_by_url: Dict[str, OCPodcast] = {p.feed_url: p for p in oc_subs}
+
+    apple_feed_set = {url for url in apple_feeds if url}
+
+    to_add = sorted(apple_feed_set - oc_feed_urls)
+    to_remove = sorted(oc_feed_urls - apple_feed_set) if sync_remove else []
+
+    print(f"\nApple Podcasts : {len(apple_feed_set)} subscriptions", file=sys.stderr)
+    print(f"Overcast       : {len(oc_feed_urls)} subscriptions", file=sys.stderr)
+    print(f"To subscribe   : {len(to_add)}", file=sys.stderr)
+    if sync_remove:
+        print(f"To remove      : {len(to_remove)}", file=sys.stderr)
+
+    if not to_add and not to_remove:
+        print("\nAlready in sync.", file=sys.stderr)
+        return
+
+    if to_add:
+        label = "Subscribing" if confirm else "Would subscribe"
+        print(f"\n{label}:", file=sys.stderr)
+        for url in to_add:
+            print(f"  + {url}", file=sys.stderr)
+
+    if to_remove:
+        label = "Unsubscribing" if confirm else "Would unsubscribe"
+        print(f"\n{label}:", file=sys.stderr)
+        for url in to_remove:
+            p = oc_by_url[url]
+            print(f"  - {p.title or url}", file=sys.stderr)
+
+    if not confirm:
+        print("\nDry-run — add --confirm to apply.", file=sys.stderr)
+        return
+
+    for url in to_add:
+        oc_subscribe(opener, url, csrf_fields)
+        time.sleep(OC_RATE_LIMIT_SECS)
+
+    removed = 0
+    for url in to_remove:
+        p = oc_by_url[url]
+        if not p.overcast_id:
+            print(f"  Skipping {p.title or url} — no Overcast ID in export.",
+                  file=sys.stderr)
+            continue
+        oc_unsubscribe(opener, p.overcast_id, csrf_fields)
+        removed += 1
+        time.sleep(OC_RATE_LIMIT_SECS)
+
+    print(
+        f"\nDone: {len(to_add)} added, {removed} removed.",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Castro sync (OPML-based — no public API)
+# ---------------------------------------------------------------------------
+
+
+def cmd_sync_castro(
+    podcasts: List[Podcast],
+    output_path: Optional[Path],
+    title: str,
+) -> None:
+    """Generate an OPML file for Castro import.
+
+    Castro has no public API. The only way to sync is to import an OPML file
+    manually via Castro → Settings → Import Subscriptions.
+    """
+    opml_content = format_as_opml(iter(podcasts), title=title)
+
+    if output_path:
+        try:
+            output_path.write_text(opml_content, encoding="utf-8")
+        except OSError as e:
+            raise SystemExit(f"Unable to write to {output_path!r}: {e}")
+        print(f"OPML saved to: {output_path}", file=sys.stderr)
+    else:
+        print(opml_content, end="")
+
+    print(
+        "\nTo import in Castro:\n"
+        "  1. Transfer the OPML file to your iPhone/iPad\n"
+        "     (AirDrop, iCloud Drive, Files app, etc.)\n"
+        "  2. Open Castro\n"
+        "  3. Tap the gear icon → Import Subscriptions\n"
+        "  4. Select the OPML file\n"
+        "\nNote: Castro has no public API — OPML import is the only sync method.",
+        file=sys.stderr,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Schema inspection
 # ---------------------------------------------------------------------------
 
@@ -468,7 +900,7 @@ def cmd_schema(connection: sqlite3.Connection) -> None:
     print(f"ZMTPODCAST — {len(cols)} column(s):\n")
     date_col = detect_date_column(cols)
     for col in cols:
-        tag = " ← stale detection" if col == date_col else ""
+        tag = " <- stale detection" if col == date_col else ""
         print(f"  {col}{tag}")
     if date_col is None:
         print(
@@ -528,10 +960,57 @@ def parse_args() -> argparse.Namespace:
         type=parse_duration,
         help=(
             "Filter to podcasts with no activity for the given duration. "
-            "Examples: 1y, 6m, 90d. "
-            "Combines with --format to export or review the stale list."
+            "Examples: 1y, 6m, 90d."
         ),
     )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print subscription statistics and exit.",
+    )
+    parser.add_argument(
+        "--broken",
+        action="store_true",
+        help="Check all feed URLs via HTTP HEAD and report unreachable ones.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Parallel workers for --broken (default: 10).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        metavar="SECS",
+        help="HTTP timeout in seconds for --broken (default: 10).",
+    )
+    parser.add_argument(
+        "--diff",
+        metavar="OPML_FILE",
+        help="Compare Apple Podcasts subscriptions against an existing OPML file.",
+    )
+
+    # Shared sync flag
+    parser.add_argument(
+        "--sync-remove",
+        action="store_true",
+        help=(
+            "Also remove from the target app any podcast no longer in Apple Podcasts. "
+            "Applies to --sync-pocketcasts and --sync-overcast."
+        ),
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help=(
+            "Actually execute destructive operations: --unsubscribe, "
+            "--sync-pocketcasts, --sync-overcast."
+        ),
+    )
+
     # Pocket Casts sync
     pc_group = parser.add_argument_group("Pocket Casts sync")
     pc_group.add_argument(
@@ -552,12 +1031,42 @@ def parse_args() -> argparse.Namespace:
         metavar="PASSWORD",
         help="Pocket Casts password (or set POCKETCASTS_PASSWORD env var).",
     )
-    pc_group.add_argument(
-        "--sync-remove",
+
+    # Overcast sync
+    oc_group = parser.add_argument_group(
+        "Overcast sync",
+        "Uses the unofficial Overcast web interface — may break on UI changes.",
+    )
+    oc_group.add_argument(
+        "--sync-overcast",
         action="store_true",
         help=(
-            "Also remove from Pocket Casts any podcast no longer in Apple Podcasts. "
-            "Requires --sync-pocketcasts."
+            "Sync Apple Podcasts subscriptions to Overcast. "
+            "Dry-run by default; add --confirm to apply."
+        ),
+    )
+    oc_group.add_argument(
+        "--oc-email",
+        metavar="EMAIL",
+        help="Overcast email (or set OVERCAST_EMAIL env var).",
+    )
+    oc_group.add_argument(
+        "--oc-password",
+        metavar="PASSWORD",
+        help="Overcast password (or set OVERCAST_PASSWORD env var).",
+    )
+
+    # Castro sync
+    castro_group = parser.add_argument_group(
+        "Castro sync",
+        "Castro has no public API — generates an OPML file for manual import.",
+    )
+    castro_group.add_argument(
+        "--sync-castro",
+        action="store_true",
+        help=(
+            "Generate an OPML file for Castro import. "
+            "Use --output to save to a file."
         ),
     )
 
@@ -565,15 +1074,9 @@ def parse_args() -> argparse.Namespace:
         "--unsubscribe",
         action="store_true",
         help=(
-            "Remove matched podcasts from the database. "
-            "Combine with --stale to target inactive ones. "
-            "Dry-run by default; add --confirm to apply."
+            "Remove matched podcasts from the Apple Podcasts database. "
+            "Combine with --stale. Dry-run by default; add --confirm to apply."
         ),
-    )
-    parser.add_argument(
-        "--confirm",
-        action="store_true",
-        help="Actually execute --unsubscribe (requires Podcasts.app to be closed).",
     )
     parser.add_argument(
         "--schema",
@@ -610,21 +1113,34 @@ def main() -> None:
                 f"Run --schema to inspect the table."
             )
 
-        podcast_iter: Iterator[Podcast] = get_podcasts(
-            connection,
-            subscribed_only=subscribed_only,
-            date_column=date_column,
-        )
-
-        if stale_delta is not None:
-            cutoff = datetime.now(tz=timezone.utc) - stale_delta
-            podcast_iter = filter_stale(podcast_iter, cutoff)
-            print(
-                f"Podcasts with no activity since "
-                f"{cutoff.strftime('%Y-%m-%d')} "
-                f"(field: {date_column}):",
-                file=sys.stderr,
+        if cast(bool, args.stats):
+            all_podcasts = list(
+                get_podcasts(connection, subscribed_only=False, date_column=date_column)
             )
+            cmd_stats(all_podcasts, date_column)
+            return
+
+        if cast(bool, args.broken):
+            all_podcasts = list(get_podcasts(connection, subscribed_only=True))
+            cmd_broken(
+                all_podcasts,
+                timeout=cast(int, args.timeout),
+                workers=cast(int, args.workers),
+            )
+            return
+
+        if cast(Optional[str], args.diff):
+            all_podcasts = list(get_podcasts(connection, subscribed_only=True))
+            cmd_diff(all_podcasts, Path(cast(str, args.diff)))
+            return
+
+        if cast(bool, args.sync_castro):
+            all_podcasts = list(get_podcasts(connection, subscribed_only=True))
+            out_path = (
+                Path(cast(str, args.output)) if cast(Optional[str], args.output) else None
+            )
+            cmd_sync_castro(all_podcasts, out_path, title=cast(str, args.title))
+            return
 
         if cast(bool, args.sync_pocketcasts):
             email: str = (
@@ -654,6 +1170,51 @@ def main() -> None:
                 confirm=cast(bool, args.confirm),
             )
             return
+
+        if cast(bool, args.sync_overcast):
+            oc_email: str = (
+                os.environ.get("OVERCAST_EMAIL")
+                or cast(str, args.oc_email or "")
+            )
+            oc_password: str = (
+                os.environ.get("OVERCAST_PASSWORD")
+                or cast(str, args.oc_password or "")
+            )
+            if not oc_email or not oc_password:
+                raise SystemExit(
+                    "Overcast credentials required.\n"
+                    "Set OVERCAST_EMAIL / OVERCAST_PASSWORD env vars "
+                    "or use --oc-email / --oc-password."
+                )
+            apple_feeds_oc = [
+                p.feed_url
+                for p in get_podcasts(connection, subscribed_only=True)
+                if p.feed_url
+            ]
+            cmd_sync_overcast(
+                apple_feeds=apple_feeds_oc,
+                email=oc_email,
+                password=oc_password,
+                sync_remove=cast(bool, args.sync_remove),
+                confirm=cast(bool, args.confirm),
+            )
+            return
+
+        podcast_iter: Iterator[Podcast] = get_podcasts(
+            connection,
+            subscribed_only=subscribed_only,
+            date_column=date_column,
+        )
+
+        if stale_delta is not None:
+            cutoff = datetime.now(tz=timezone.utc) - stale_delta
+            podcast_iter = filter_stale(podcast_iter, cutoff)
+            print(
+                f"Podcasts with no activity since "
+                f"{cutoff.strftime('%Y-%m-%d')} "
+                f"(field: {date_column}):",
+                file=sys.stderr,
+            )
 
         if cast(bool, args.unsubscribe):
             matched = list(podcast_iter)

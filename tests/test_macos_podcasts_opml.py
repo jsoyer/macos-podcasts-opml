@@ -5,8 +5,8 @@ import sqlite3
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Tuple
-from unittest.mock import MagicMock, patch
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -65,7 +65,6 @@ def test_podcast_is_immutable() -> None:
 
 
 def test_coredata_to_datetime_known_value() -> None:
-    # 978307200 seconds after epoch = 2001-01-01
     result = m.coredata_to_datetime(0.0)
     assert result is not None
     assert result.year == 2001
@@ -388,7 +387,6 @@ def test_unsubscribe_dry_run_does_not_modify(tmp_path: Path) -> None:
     ])
     count = m.unsubscribe_from_db(db, ["https://a.example/feed"], dry_run=True)
     assert count == 1
-    # DB untouched
     conn = sqlite3.connect(str(db))
     rows = conn.execute("SELECT COUNT(*) FROM ZMTPODCAST").fetchone()
     conn.close()
@@ -463,7 +461,6 @@ def test_cmd_unsubscribe_dry_run_does_not_require_app_closed(
     db = tmp_path / "db.sqlite"
     make_file_db(db, [("Pod A", "https://a.example/feed", "")])
     podcasts = [m.Podcast("Pod A", "https://a.example/feed", "")]
-    # Podcasts.app "running" — but dry_run should not care
     with patch("macos_podcasts_opml.is_podcasts_running", return_value=True):
         m.cmd_unsubscribe(db, podcasts, confirm=False)
     captured = capsys.readouterr()
@@ -500,6 +497,180 @@ def test_cmd_unsubscribe_confirm_executes_when_app_closed(
 
 
 # ---------------------------------------------------------------------------
+# check_feed_url
+# ---------------------------------------------------------------------------
+
+
+def _make_http_resp_mock(status: int, body: bytes = b"") -> MagicMock:
+    ctx = MagicMock()
+    ctx.__enter__ = MagicMock(return_value=ctx)
+    ctx.__exit__ = MagicMock(return_value=False)
+    ctx.status = status
+    ctx.read.return_value = body
+    return ctx
+
+
+def test_check_feed_url_ok_returns_none() -> None:
+    resp = _make_http_resp_mock(200)
+    with patch("urllib.request.urlopen", return_value=resp):
+        assert m.check_feed_url("https://good.example/feed") is None
+
+
+def test_check_feed_url_404_returns_error() -> None:
+    import urllib.error as _ue
+
+    err = _ue.HTTPError("https://bad.example/feed", 404, "Not Found", {}, None)  # type: ignore[arg-type]
+    with patch("urllib.request.urlopen", side_effect=err):
+        result = m.check_feed_url("https://bad.example/feed")
+    assert result == "HTTP 404"
+
+
+def test_check_feed_url_timeout_returns_error() -> None:
+    import urllib.error as _ue
+
+    err = _ue.URLError("timed out")
+    with patch("urllib.request.urlopen", side_effect=err):
+        result = m.check_feed_url("https://slow.example/feed")
+    assert result is not None
+    assert "URLError" in result
+
+
+# ---------------------------------------------------------------------------
+# cmd_broken
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_broken_reports_broken_feeds(capsys: pytest.CaptureFixture[str]) -> None:
+    podcasts = [
+        m.Podcast("Good Pod", "https://good.example/feed", ""),
+        m.Podcast("Bad Pod", "https://bad.example/feed", ""),
+    ]
+
+    def mock_check(url: str, timeout: int = 10) -> Optional[str]:
+        return "HTTP 404" if "bad" in url else None
+
+    with patch("macos_podcasts_opml.check_feed_url", side_effect=mock_check):
+        m.cmd_broken(podcasts, workers=2)
+
+    captured = capsys.readouterr()
+    assert "HTTP 404" in captured.out
+    assert "Bad Pod" in captured.out
+    assert "1 broken" in captured.out
+
+
+def test_cmd_broken_all_ok(capsys: pytest.CaptureFixture[str]) -> None:
+    podcasts = [m.Podcast("Good", "https://good.example/feed", "")]
+
+    with patch("macos_podcasts_opml.check_feed_url", return_value=None):
+        m.cmd_broken(podcasts, workers=1)
+
+    assert "reachable" in capsys.readouterr().err
+
+
+def test_cmd_broken_skips_no_feed_url(capsys: pytest.CaptureFixture[str]) -> None:
+    podcasts = [m.Podcast("No URL", "", "")]
+    with patch("macos_podcasts_opml.check_feed_url") as mock_check:
+        m.cmd_broken(podcasts)
+    mock_check.assert_not_called()
+    assert "No podcasts" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# cmd_stats
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_stats_basic(capsys: pytest.CaptureFixture[str]) -> None:
+    now = datetime.now(tz=timezone.utc)
+    podcasts = [
+        m.Podcast("Recent", "https://a.example/feed", "", last_date=now - timedelta(days=10)),
+        m.Podcast("Old", "https://b.example/feed", "", last_date=now - timedelta(days=800)),
+        m.Podcast("NoDate", "https://c.example/feed", ""),
+    ]
+    m.cmd_stats(podcasts, "ZLASTPUBLISHDATE")
+    out = capsys.readouterr().out
+    assert "Total podcasts  : 3" in out
+    assert "No date" in out
+
+
+def test_cmd_stats_empty(capsys: pytest.CaptureFixture[str]) -> None:
+    m.cmd_stats([], None)
+    assert "No podcasts" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# parse_opml_feeds
+# ---------------------------------------------------------------------------
+
+SAMPLE_OPML = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="1.0">
+  <head><title>Test</title></head>
+  <body>
+    <outline type="rss" text="Pod A" xmlUrl="https://a.example/feed" htmlUrl="https://a.example"/>
+    <outline type="rss" text="Pod B" xmlUrl="https://b.example/feed" htmlUrl="https://b.example"/>
+  </body>
+</opml>
+"""
+
+
+def test_parse_opml_feeds_returns_mapping(tmp_path: Path) -> None:
+    opml_file = tmp_path / "test.opml"
+    opml_file.write_text(SAMPLE_OPML, encoding="utf-8")
+    feeds = m.parse_opml_feeds(opml_file)
+    assert len(feeds) == 2
+    assert feeds["https://a.example/feed"] == "Pod A"
+    assert feeds["https://b.example/feed"] == "Pod B"
+
+
+def test_parse_opml_feeds_invalid_raises(tmp_path: Path) -> None:
+    bad_file = tmp_path / "bad.opml"
+    bad_file.write_text("not xml at all", encoding="utf-8")
+    with pytest.raises(SystemExit, match="Failed to parse"):
+        m.parse_opml_feeds(bad_file)
+
+
+# ---------------------------------------------------------------------------
+# cmd_diff
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_diff_identical(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    opml_file = tmp_path / "test.opml"
+    opml_file.write_text(SAMPLE_OPML, encoding="utf-8")
+    podcasts = [
+        m.Podcast("Pod A", "https://a.example/feed", ""),
+        m.Podcast("Pod B", "https://b.example/feed", ""),
+    ]
+    m.cmd_diff(podcasts, opml_file)
+    assert "No differences" in capsys.readouterr().out
+
+
+def test_cmd_diff_only_in_apple(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    opml_file = tmp_path / "test.opml"
+    opml_file.write_text(SAMPLE_OPML, encoding="utf-8")
+    podcasts = [
+        m.Podcast("Pod A", "https://a.example/feed", ""),
+        m.Podcast("Pod B", "https://b.example/feed", ""),
+        m.Podcast("Pod C", "https://c.example/feed", ""),
+    ]
+    m.cmd_diff(podcasts, opml_file)
+    out = capsys.readouterr().out
+    assert "Only in Apple Podcasts" in out
+    assert "Pod C" in out
+
+
+def test_cmd_diff_only_in_opml(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    opml_file = tmp_path / "test.opml"
+    opml_file.write_text(SAMPLE_OPML, encoding="utf-8")
+    podcasts = [m.Podcast("Pod A", "https://a.example/feed", "")]
+    m.cmd_diff(podcasts, opml_file)
+    out = capsys.readouterr().out
+    assert "Only in OPML" in out
+    assert "Pod B" in out
+
+
+# ---------------------------------------------------------------------------
 # Pocket Casts API helpers
 # ---------------------------------------------------------------------------
 
@@ -513,7 +684,7 @@ def _make_urlopen_mock(response_data: Any) -> MagicMock:
     return ctx
 
 
-def _pc_subs_response(podcasts: List[dict[str, str]]) -> dict[str, Any]:
+def _pc_subs_response(podcasts: List[Dict[str, str]]) -> Dict[str, Any]:
     return {"podcasts": podcasts}
 
 
@@ -578,9 +749,8 @@ def test_pc_list_subscriptions_empty() -> None:
 
 
 def _setup_sync_mocks(
-    pc_podcasts: List[dict[str, str]],
+    pc_podcasts: List[Dict[str, str]],
 ) -> MagicMock:
-    """Return a side_effect list for urlopen: login → list → (subscribe/unsubscribe)*."""
     login_resp = _make_urlopen_mock({"token": "test-token"})
     list_resp = _make_urlopen_mock(_pc_subs_response(pc_podcasts))
     subscribe_resp = _make_urlopen_mock({})
@@ -600,7 +770,6 @@ def test_sync_dry_run_does_not_call_subscribe(
             sync_remove=False,
             confirm=False,
         )
-    # Only 2 calls: login + list. No subscribe.
     assert mock.call_count == 2
     captured = capsys.readouterr()
     assert "Dry-run" in captured.err
@@ -620,7 +789,6 @@ def test_sync_confirm_calls_subscribe_for_new_feeds(
                 sync_remove=False,
                 confirm=True,
             )
-    # login + list + 2 subscribes
     assert mock.call_count == 4
     captured = capsys.readouterr()
     assert "2 added" in captured.err
@@ -641,7 +809,6 @@ def test_sync_skips_already_subscribed_feeds(
                 sync_remove=False,
                 confirm=True,
             )
-    # login + list only — nothing to add
     assert mock.call_count == 2
     assert "Already in sync" in capsys.readouterr().err
 
@@ -662,7 +829,6 @@ def test_sync_remove_unsubscribes_missing_feeds(
                 sync_remove=True,
                 confirm=True,
             )
-    # login + list + 1 unsubscribe
     assert mock.call_count == 3
     captured = capsys.readouterr()
     assert "0 added, 1 removed" in captured.err
@@ -684,3 +850,222 @@ def test_sync_remove_dry_run_does_not_unsubscribe(
         )
     assert mock.call_count == 2
     assert "Dry-run" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Overcast helpers
+# ---------------------------------------------------------------------------
+
+OVERCAST_LOGIN_HTML = """
+<html><body>
+<form action="/login" method="post">
+  <input type="hidden" name="csrf_token" value="csrf-abc">
+  <input type="email" name="email">
+  <input type="password" name="password">
+</form>
+</body></html>
+"""
+
+OVERCAST_ACCOUNT_HTML = """
+<html><body>
+<form action="/account" method="post">
+  <input type="hidden" name="csrf_token" value="csrf-xyz">
+</form>
+</body></html>
+"""
+
+OVERCAST_ACCOUNT_LOGGED_IN = """
+<html><body>
+<div class="account-content">Logged in as user@example.com</div>
+<form action="/account" method="post">
+  <input type="hidden" name="csrf_token" value="csrf-xyz">
+</form>
+</body></html>
+"""
+
+OVERCAST_OPML = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<opml version="1.0">
+  <body>
+    <outline type="rss" text="Pod A" xmlUrl="https://a.example/feed"
+             htmlUrl="https://overcast.fm/itunes111111"/>
+    <outline type="rss" text="Pod B" xmlUrl="https://b.example/feed"
+             htmlUrl="https://overcast.fm/itunes222222"/>
+  </body>
+</opml>
+"""
+
+
+def _make_oc_opener_mock(*html_responses: str) -> MagicMock:
+    """Mock opener whose .open() returns successive HTML responses."""
+    opener = MagicMock()
+
+    def make_ctx(content: str) -> MagicMock:
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=ctx)
+        ctx.__exit__ = MagicMock(return_value=False)
+        ctx.read.return_value = content.encode("utf-8")
+        return ctx
+
+    opener.open.side_effect = [make_ctx(r) for r in html_responses]
+    return opener
+
+
+# ---------------------------------------------------------------------------
+# _oc_extract_form_fields
+# ---------------------------------------------------------------------------
+
+
+def test_oc_extract_form_fields_finds_hidden() -> None:
+    fields = m._oc_extract_form_fields(OVERCAST_LOGIN_HTML)
+    assert fields.get("csrf_token") == "csrf-abc"
+
+
+def test_oc_extract_form_fields_ignores_non_hidden() -> None:
+    fields = m._oc_extract_form_fields(OVERCAST_LOGIN_HTML)
+    assert "email" not in fields
+    assert "password" not in fields
+
+
+# ---------------------------------------------------------------------------
+# oc_login
+# ---------------------------------------------------------------------------
+
+
+def test_oc_login_success() -> None:
+    opener = _make_oc_opener_mock(
+        OVERCAST_LOGIN_HTML,       # GET /login
+        OVERCAST_ACCOUNT_LOGGED_IN,  # POST /login response
+        OVERCAST_ACCOUNT_HTML,      # GET /account for CSRF
+    )
+    with patch("macos_podcasts_opml._oc_build_opener", return_value=opener):
+        result_opener, csrf_fields = m.oc_login("u@example.com", "pw")
+    assert csrf_fields.get("csrf_token") == "csrf-xyz"
+
+
+def test_oc_login_fails_on_rejected_credentials() -> None:
+    # Server still shows the login form → credentials rejected
+    opener = _make_oc_opener_mock(
+        OVERCAST_LOGIN_HTML,   # GET /login
+        OVERCAST_LOGIN_HTML,   # POST /login → still shows login form
+    )
+    with patch("macos_podcasts_opml._oc_build_opener", return_value=opener):
+        with pytest.raises(SystemExit, match="login failed"):
+            m.oc_login("u@example.com", "wrong")
+
+
+# ---------------------------------------------------------------------------
+# oc_list_subscriptions
+# ---------------------------------------------------------------------------
+
+
+def test_oc_list_subscriptions_parses_opml() -> None:
+    opener = _make_oc_opener_mock(OVERCAST_OPML)
+    result = m.oc_list_subscriptions(opener)
+    assert len(result) == 2
+    assert result[0].feed_url == "https://a.example/feed"
+    assert result[0].title == "Pod A"
+    assert result[0].overcast_id == "itunes111111"
+    assert result[1].overcast_id == "itunes222222"
+
+
+def test_oc_list_subscriptions_invalid_opml() -> None:
+    opener = _make_oc_opener_mock("not xml")
+    with pytest.raises(SystemExit, match="parse Overcast OPML"):
+        m.oc_list_subscriptions(opener)
+
+
+# ---------------------------------------------------------------------------
+# cmd_sync_overcast
+# ---------------------------------------------------------------------------
+
+
+def test_oc_sync_dry_run_no_subscribes(capsys: pytest.CaptureFixture[str]) -> None:
+    opener = _make_oc_opener_mock(
+        OVERCAST_LOGIN_HTML,        # GET /login
+        OVERCAST_ACCOUNT_LOGGED_IN, # POST /login
+        OVERCAST_ACCOUNT_HTML,      # GET /account for CSRF
+        OVERCAST_OPML,              # GET /account/export_opml
+    )
+    with patch("macos_podcasts_opml._oc_build_opener", return_value=opener):
+        m.cmd_sync_overcast(
+            apple_feeds=["https://new.example/feed"],
+            email="u@example.com",
+            password="pw",
+            sync_remove=False,
+            confirm=False,
+        )
+    captured = capsys.readouterr()
+    assert "Dry-run" in captured.err
+    assert "https://new.example/feed" in captured.err
+    # No extra calls beyond login + list
+    assert opener.open.call_count == 4
+
+
+def test_oc_sync_already_in_sync(capsys: pytest.CaptureFixture[str]) -> None:
+    opener = _make_oc_opener_mock(
+        OVERCAST_LOGIN_HTML,
+        OVERCAST_ACCOUNT_LOGGED_IN,
+        OVERCAST_ACCOUNT_HTML,
+        OVERCAST_OPML,
+    )
+    with patch("macos_podcasts_opml._oc_build_opener", return_value=opener):
+        m.cmd_sync_overcast(
+            apple_feeds=["https://a.example/feed", "https://b.example/feed"],
+            email="u@example.com",
+            password="pw",
+            sync_remove=False,
+            confirm=True,
+        )
+    assert "Already in sync" in capsys.readouterr().err
+
+
+def test_oc_sync_confirm_subscribes(capsys: pytest.CaptureFixture[str]) -> None:
+    opener = _make_oc_opener_mock(
+        OVERCAST_LOGIN_HTML,
+        OVERCAST_ACCOUNT_LOGGED_IN,
+        OVERCAST_ACCOUNT_HTML,
+        OVERCAST_OPML,
+        "<html/>",  # POST subscribe response
+    )
+    with patch("macos_podcasts_opml._oc_build_opener", return_value=opener):
+        with patch("time.sleep"):
+            m.cmd_sync_overcast(
+                apple_feeds=["https://new.example/feed"],
+                email="u@example.com",
+                password="pw",
+                sync_remove=False,
+                confirm=True,
+            )
+    captured = capsys.readouterr()
+    assert "1 added" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# cmd_sync_castro
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_sync_castro_writes_opml_to_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    podcasts = [
+        m.Podcast("Pod A", "https://a.example/feed", "https://a.example"),
+    ]
+    out_file = tmp_path / "castro.opml"
+    m.cmd_sync_castro(podcasts, out_file, title="My Podcasts")
+    assert out_file.exists()
+    content = out_file.read_text(encoding="utf-8")
+    assert "https://a.example/feed" in content
+    captured = capsys.readouterr()
+    assert "Castro" in captured.err
+    assert "Import Subscriptions" in captured.err
+
+
+def test_cmd_sync_castro_prints_to_stdout_without_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    podcasts = [m.Podcast("Pod A", "https://a.example/feed", "")]
+    m.cmd_sync_castro(podcasts, None, title="Export")
+    out = capsys.readouterr().out
+    assert "https://a.example/feed" in out
