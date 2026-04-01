@@ -210,7 +210,7 @@ def format_as_opml(podcasts: Iterator[Podcast], title: str = "MacOS Podcasts") -
         )
 
     dom = minidom.parseString(ET.tostring(root, method="xml"))
-    return cast(str, dom.toprettyxml(indent="  "))
+    return dom.toprettyxml(indent="  ")
 
 
 def format_as_json(podcasts: Iterator[Podcast], include_date: bool = False) -> str:
@@ -667,8 +667,9 @@ class _FormFieldExtractor(html.parser.HTMLParser):
     ) -> None:
         if tag == "input":
             d = dict(attrs)
-            if d.get("type") == "hidden" and d.get("name"):
-                self.fields[d["name"]] = d.get("value") or ""
+            name = d.get("name")
+            if d.get("type") == "hidden" and name:
+                self.fields[name] = d.get("value") or ""
 
 
 def _oc_extract_form_fields(html_content: str) -> Dict[str, str]:
