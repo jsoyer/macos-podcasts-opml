@@ -173,6 +173,19 @@ def parse_duration(s: str) -> timedelta:
     return timedelta(days=value)
 
 
+def parse_since(s: str) -> datetime:
+    """Parse an ISO date string like '2024-01-01' into a timezone-aware datetime."""
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid date {s!r}. Use ISO format, e.g. '2024-01-01'."
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def filter_stale(
     podcasts: Iterator[Podcast], cutoff: datetime
 ) -> Iterator[Podcast]:
@@ -523,6 +536,89 @@ def cmd_diff(apple_podcasts: List[Podcast], opml_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Credential resolution (literal, 1Password CLI, macOS Keychain)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_credential(value: str) -> str:
+    """Resolve a credential value — may be a literal, op:// URI, or keychain: ref.
+
+    Supported formats:
+      - Literal string (default, returned as-is)
+      - op://vault/item/field   — read from 1Password CLI (requires `op` in PATH)
+      - keychain:SERVICE        — macOS Keychain, no specific account
+      - keychain:SERVICE:ACCOUNT — macOS Keychain with an explicit account name
+    """
+    if not value:
+        return value
+
+    if value.startswith("op://"):
+        try:
+            result = subprocess.run(
+                ["op", "read", "--no-newline", value],
+                capture_output=True, text=True, check=True,
+            )
+            return result.stdout
+        except FileNotFoundError:
+            raise SystemExit(
+                "1Password CLI (op) not found. "
+                "Install it from: https://developer.1password.com/docs/cli/"
+            )
+        except subprocess.CalledProcessError as e:
+            raise SystemExit(
+                f"1Password read failed for {value!r}: {e.stderr.strip()}"
+            )
+
+    if value.startswith("keychain:"):
+        rest = value[9:]
+        parts = rest.split(":", 1)
+        service = parts[0]
+        account = parts[1] if len(parts) > 1 else ""
+        cmd = ["security", "find-generic-password", "-s", service, "-w"]
+        if account:
+            cmd += ["-a", account]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return result.stdout.rstrip("\n")
+        except FileNotFoundError:
+            raise SystemExit("'security' command not found — Keychain is macOS only.")
+        except subprocess.CalledProcessError:
+            hint = f"security add-generic-password -s '{service}'"
+            if account:
+                hint += f" -a '{account}'"
+            hint += " -w"
+            raise SystemExit(
+                f"Keychain lookup failed for service={service!r}"
+                + (f", account={account!r}" if account else "")
+                + f"\nAdd with: {hint}"
+            )
+
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Notifications (macOS only, silent no-op elsewhere)
+# ---------------------------------------------------------------------------
+
+
+def _notify(title: str, message: str) -> None:
+    """Send a macOS notification. Silent no-op on non-macOS or missing osascript."""
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(
+            [
+                "osascript", "-e",
+                f"display notification {json.dumps(message)} "
+                f"with title {json.dumps(title)}",
+            ],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Pocket Casts API
 # ---------------------------------------------------------------------------
 
@@ -648,6 +744,7 @@ def cmd_sync_pocketcasts(
         f"\nDone: {len(to_add)} added, {len(to_remove)} removed.",
         file=sys.stderr,
     )
+    _notify("Pocket Casts Sync", f"{len(to_add)} added, {len(to_remove)} removed.")
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +948,7 @@ def cmd_sync_overcast(
         f"\nDone: {len(to_add)} added, {removed} removed.",
         file=sys.stderr,
     )
+    _notify("Overcast Sync", f"{len(to_add)} added, {removed} removed.")
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +987,41 @@ def cmd_sync_castro(
         "\nNote: Castro has no public API — OPML import is the only sync method.",
         file=sys.stderr,
     )
+
+
+# ---------------------------------------------------------------------------
+# Duplicate detection
+# ---------------------------------------------------------------------------
+
+
+def _normalize_feed_url(url: str) -> str:
+    """Normalize a feed URL for duplicate comparison (lowercase, https, no trailing slash)."""
+    url = url.strip().lower()
+    if url.startswith("http://"):
+        url = "https://" + url[7:]
+    return url.rstrip("/")
+
+
+def cmd_dupes(podcasts: List[Podcast]) -> None:
+    """Report podcasts that appear to be subscribed more than once."""
+    from collections import defaultdict
+
+    groups: Dict[str, List[Podcast]] = defaultdict(list)
+    for p in podcasts:
+        if p.feed_url:
+            groups[_normalize_feed_url(p.feed_url)].append(p)
+
+    dupes = {k: v for k, v in groups.items() if len(v) > 1}
+
+    if not dupes:
+        print(f"No duplicate subscriptions found ({len(podcasts)} checked).")
+        return
+
+    print(f"{len(dupes)} potential duplicate group(s):\n")
+    for pods in sorted(dupes.values(), key=lambda v: (v[0].title or "").lower()):
+        print(f"  {pods[0].title}")
+        for p in pods:
+            print(f"    {p.feed_url}")
 
 
 # ---------------------------------------------------------------------------
@@ -955,14 +1088,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only export podcasts that have a valid feed URL.",
     )
-    parser.add_argument(
+    cutoff_group = parser.add_mutually_exclusive_group()
+    cutoff_group.add_argument(
         "--stale",
         metavar="DURATION",
         type=parse_duration,
-        help=(
-            "Filter to podcasts with no activity for the given duration. "
-            "Examples: 1y, 6m, 90d."
-        ),
+        help="Filter to podcasts inactive for the given duration (e.g. 1y, 6m, 90d).",
+    )
+    cutoff_group.add_argument(
+        "--since",
+        metavar="DATE",
+        type=parse_since,
+        help="Filter to podcasts with no activity since DATE (ISO format: 2024-01-01).",
     )
     parser.add_argument(
         "--stats",
@@ -1072,11 +1209,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--dupes",
+        action="store_true",
+        help="Report podcasts subscribed more than once (http/https and trailing-slash aware).",
+    )
+    parser.add_argument(
         "--unsubscribe",
         action="store_true",
         help=(
             "Remove matched podcasts from the Apple Podcasts database. "
-            "Combine with --stale. Dry-run by default; add --confirm to apply."
+            "Combine with --stale or --since. Dry-run by default; add --confirm to apply."
         ),
     )
     parser.add_argument(
@@ -1104,12 +1246,21 @@ def main() -> None:
         cols = table_columns(connection, "ZMTPODCAST")
         date_column = detect_date_column(cols)
         stale_delta: Optional[timedelta] = cast(Optional[timedelta], args.stale)
+        since_date: Optional[datetime] = cast(Optional[datetime], args.since)
         subscribed_only: bool = cast(bool, args.subscribed_only)
-        include_date = stale_delta is not None or date_column is not None
 
-        if stale_delta is not None and date_column is None:
+        # Unified cutoff: either --stale (relative) or --since (absolute)
+        cutoff: Optional[datetime] = None
+        if stale_delta is not None:
+            cutoff = datetime.now(tz=timezone.utc) - stale_delta
+        elif since_date is not None:
+            cutoff = since_date
+
+        include_date = cutoff is not None or date_column is not None
+
+        if cutoff is not None and date_column is None:
             raise SystemExit(
-                f"--stale requires a date column in the database, "
+                f"--stale/--since requires a date column in the database, "
                 f"but none of {DATE_COLUMNS} were found. "
                 f"Run --schema to inspect the table."
             )
@@ -1135,6 +1286,11 @@ def main() -> None:
             cmd_diff(all_podcasts, Path(cast(str, args.diff)))
             return
 
+        if cast(bool, args.dupes):
+            all_podcasts = list(get_podcasts(connection, subscribed_only=True))
+            cmd_dupes(all_podcasts)
+            return
+
         if cast(bool, args.sync_castro):
             all_podcasts = list(get_podcasts(connection, subscribed_only=True))
             out_path = (
@@ -1144,13 +1300,11 @@ def main() -> None:
             return
 
         if cast(bool, args.sync_pocketcasts):
-            email: str = (
-                os.environ.get("POCKETCASTS_EMAIL")
-                or cast(str, args.pc_email or "")
+            email: str = _resolve_credential(
+                os.environ.get("POCKETCASTS_EMAIL") or cast(str, args.pc_email or "")
             )
-            password: str = (
-                os.environ.get("POCKETCASTS_PASSWORD")
-                or cast(str, args.pc_password or "")
+            password: str = _resolve_credential(
+                os.environ.get("POCKETCASTS_PASSWORD") or cast(str, args.pc_password or "")
             )
             if not email or not password:
                 raise SystemExit(
@@ -1173,13 +1327,11 @@ def main() -> None:
             return
 
         if cast(bool, args.sync_overcast):
-            oc_email: str = (
-                os.environ.get("OVERCAST_EMAIL")
-                or cast(str, args.oc_email or "")
+            oc_email: str = _resolve_credential(
+                os.environ.get("OVERCAST_EMAIL") or cast(str, args.oc_email or "")
             )
-            oc_password: str = (
-                os.environ.get("OVERCAST_PASSWORD")
-                or cast(str, args.oc_password or "")
+            oc_password: str = _resolve_credential(
+                os.environ.get("OVERCAST_PASSWORD") or cast(str, args.oc_password or "")
             )
             if not oc_email or not oc_password:
                 raise SystemExit(
@@ -1207,8 +1359,7 @@ def main() -> None:
             date_column=date_column,
         )
 
-        if stale_delta is not None:
-            cutoff = datetime.now(tz=timezone.utc) - stale_delta
+        if cutoff is not None:
             podcast_iter = filter_stale(podcast_iter, cutoff)
             print(
                 f"Podcasts with no activity since "

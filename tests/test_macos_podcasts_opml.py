@@ -1069,3 +1069,147 @@ def test_cmd_sync_castro_prints_to_stdout_without_output(
     m.cmd_sync_castro(podcasts, None, title="Export")
     out = capsys.readouterr().out
     assert "https://a.example/feed" in out
+
+
+# ---------------------------------------------------------------------------
+# parse_since
+# ---------------------------------------------------------------------------
+
+
+def test_parse_since_iso_date() -> None:
+    result = m.parse_since("2024-01-15")
+    assert result.year == 2024
+    assert result.month == 1
+    assert result.day == 15
+    assert result.tzinfo is not None
+
+
+def test_parse_since_with_time() -> None:
+    result = m.parse_since("2024-06-01T00:00:00")
+    assert result.year == 2024
+    assert result.month == 6
+
+
+def test_parse_since_invalid() -> None:
+    import argparse
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        m.parse_since("not-a-date")
+
+
+# ---------------------------------------------------------------------------
+# _resolve_credential
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_credential_literal() -> None:
+    assert m._resolve_credential("mypassword") == "mypassword"
+
+
+def test_resolve_credential_empty() -> None:
+    assert m._resolve_credential("") == ""
+
+
+def test_resolve_credential_op_success() -> None:
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.stdout = "secret-from-op"
+        mock_run.return_value.returncode = 0
+        result = m._resolve_credential("op://Personal/MyApp/password")
+    assert result == "secret-from-op"
+    mock_run.assert_called_once()
+    args = mock_run.call_args[0][0]
+    assert args[0] == "op"
+    assert "op://Personal/MyApp/password" in args
+
+
+def test_resolve_credential_op_not_found() -> None:
+    with patch("subprocess.run", side_effect=FileNotFoundError):
+        with pytest.raises(SystemExit, match="1Password CLI"):
+            m._resolve_credential("op://vault/item/field")
+
+
+def test_resolve_credential_keychain_success() -> None:
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.stdout = "keychain-secret\n"
+        mock_run.return_value.returncode = 0
+        result = m._resolve_credential("keychain:MyApp")
+    assert result == "keychain-secret"
+
+
+def test_resolve_credential_keychain_with_account() -> None:
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.stdout = "secret\n"
+        mock_run.return_value.returncode = 0
+        m._resolve_credential("keychain:MyApp:user@example.com")
+    cmd = mock_run.call_args[0][0]
+    assert "-a" in cmd
+    assert "user@example.com" in cmd
+
+
+def test_resolve_credential_keychain_failure() -> None:
+    import subprocess as sp
+
+    with patch("subprocess.run", side_effect=sp.CalledProcessError(1, "security")):
+        with pytest.raises(SystemExit, match="Keychain lookup failed"):
+            m._resolve_credential("keychain:NonExistentService")
+
+
+# ---------------------------------------------------------------------------
+# _notify
+# ---------------------------------------------------------------------------
+
+
+def test_notify_calls_osascript_on_darwin() -> None:
+    with patch("sys.platform", "darwin"):
+        with patch("subprocess.run") as mock_run:
+            m._notify("Title", "Message")
+    mock_run.assert_called_once()
+    cmd = mock_run.call_args[0][0]
+    assert cmd[0] == "osascript"
+
+
+def test_notify_noop_on_non_darwin() -> None:
+    with patch("sys.platform", "linux"):
+        with patch("subprocess.run") as mock_run:
+            m._notify("Title", "Message")
+    mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# cmd_dupes
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_dupes_no_duplicates(capsys: pytest.CaptureFixture[str]) -> None:
+    podcasts = [
+        m.Podcast("Pod A", "https://a.example/feed", ""),
+        m.Podcast("Pod B", "https://b.example/feed", ""),
+    ]
+    m.cmd_dupes(podcasts)
+    assert "No duplicate" in capsys.readouterr().out
+
+
+def test_cmd_dupes_detects_http_https(capsys: pytest.CaptureFixture[str]) -> None:
+    podcasts = [
+        m.Podcast("Pod A", "http://a.example/feed", ""),
+        m.Podcast("Pod A (duplicate)", "https://a.example/feed", ""),
+    ]
+    m.cmd_dupes(podcasts)
+    out = capsys.readouterr().out
+    assert "1 potential duplicate" in out
+    assert "http://a.example/feed" in out
+
+
+def test_cmd_dupes_detects_trailing_slash(capsys: pytest.CaptureFixture[str]) -> None:
+    podcasts = [
+        m.Podcast("Pod A", "https://a.example/feed", ""),
+        m.Podcast("Pod A", "https://a.example/feed/", ""),
+    ]
+    m.cmd_dupes(podcasts)
+    assert "1 potential duplicate" in capsys.readouterr().out
+
+
+def test_normalize_feed_url() -> None:
+    assert m._normalize_feed_url("http://a.example/feed") == "https://a.example/feed"
+    assert m._normalize_feed_url("https://a.example/feed/") == "https://a.example/feed"
+    assert m._normalize_feed_url("  HTTPS://A.EXAMPLE/FEED  ") == "https://a.example/feed"

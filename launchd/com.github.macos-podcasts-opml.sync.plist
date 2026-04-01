@@ -2,22 +2,33 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd agent for daily Apple Podcasts → Pocket Casts sync.
+  launchd agent for daily Apple Podcasts → Pocket Casts + Overcast sync.
 
   SETUP:
-    1. Edit the paths and credentials below.
+    1. Fill in REPLACE_WITH_* values below.
     2. Copy to ~/Library/LaunchAgents/
-    3. Load it:
+    3. Load:
          launchctl load ~/Library/LaunchAgents/com.github.macos-podcasts-opml.sync.plist
-    4. To unload:
+    4. Unload:
          launchctl unload ~/Library/LaunchAgents/com.github.macos-podcasts-opml.sync.plist
+    5. Run manually:
+         launchctl start com.github.macos-podcasts-opml.sync
 
   LOGS:
     tail -f ~/Library/Logs/macos-podcasts-opml-sync.log
     tail -f ~/Library/Logs/macos-podcasts-opml-sync.error.log
 
-  NOTE: Credentials are stored in plain text here. Consider using the macOS
-  Keychain and a wrapper script to retrieve them instead.
+  CREDENTIAL OPTIONS (pick one per password field):
+    a) Literal value — simple but insecure
+         <string>mysecretpassword</string>
+
+    b) 1Password CLI — requires `op` signed in (recommended)
+         <string>op://Personal/Pocket Casts/password</string>
+
+    c) macOS Keychain — store with:
+         security add-generic-password -s PocketCasts -a you@example.com -w
+       Then reference as:
+         <string>keychain:PocketCasts:you@example.com</string>
 -->
 <plist version="1.0">
 <dict>
@@ -26,7 +37,7 @@
 
   <key>ProgramArguments</key>
   <array>
-    <!-- Replace with the actual path to macos-podcasts-opml.py -->
+    <!-- Replace with the actual path to the script -->
     <string>/usr/bin/python3</string>
     <string>REPLACE_WITH_SCRIPT_PATH/macos-podcasts-opml.py</string>
     <string>--sync-pocketcasts</string>
@@ -38,8 +49,15 @@
   <dict>
     <key>POCKETCASTS_EMAIL</key>
     <string>REPLACE_WITH_EMAIL</string>
+
+    <!--
+      Choose one credential format:
+        Literal:     mysecretpassword
+        1Password:   op://Personal/Pocket Casts/password
+        Keychain:    keychain:PocketCasts:you@example.com
+    -->
     <key>POCKETCASTS_PASSWORD</key>
-    <string>REPLACE_WITH_PASSWORD</string>
+    <string>op://Personal/Pocket Casts/password</string>
   </dict>
 
   <!-- Run daily at 09:00 -->
@@ -57,7 +75,7 @@
   <key>StandardErrorPath</key>
   <string>REPLACE_WITH_HOME/Library/Logs/macos-podcasts-opml-sync.error.log</string>
 
-  <!-- Only run when not on battery (optional — remove if unwanted) -->
+  <!-- Only run on AC power (remove if running on a desktop Mac) -->
   <key>PowerType</key>
   <string>AC</string>
 </dict>
