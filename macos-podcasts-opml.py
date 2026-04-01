@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple, cast
 from xml.dom import minidom
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 POCKETCASTS_API = "https://api.pocketcasts.com"
 PC_RATE_LIMIT_SECS = 0.1
 OVERCAST_BASE = "https://overcast.fm"
